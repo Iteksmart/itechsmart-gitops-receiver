@@ -18,10 +18,14 @@ WEBHOOK_SECRET   = os.environ.get("GITOPS_WEBHOOK_SECRET", "")
 APPEND_PY        = os.environ.get("APPEND_PY", "/opt/itechsmart/audit_ledger/append.py")
 COMPOSE_DIR      = os.environ.get("COMPOSE_DIR", "/opt/itechsmart/iTechSmart-Suite")
 
-# Map service → compose file (host-side paths). Extend when adding Wave 2+ services.
 COMPOSE_MAP: dict[str, str] = json.loads(
     os.environ.get("GITOPS_COMPOSE_MAP", "{}")
 )
+
+# If our own service name is in the map, detect self-deploy to break the
+# SIGTERM-deadlock: docker compose up -d sends SIGTERM to us while we wait
+# for it → SIGKILL → new container stuck in Created state.
+SELF_SERVICE = os.environ.get("GITOPS_SELF_SERVICE", "gitops_receiver")
 
 app = FastAPI(title="iTechSmart GitOps Receiver", docs_url=None, redoc_url=None)
 
@@ -56,21 +60,37 @@ def _seal_receipt(service: str, image: str, outcome: str, details: dict) -> Opti
     return None
 
 
-def _deploy(service: str, compose_file: str) -> tuple[bool, str]:
-    """Pull latest image + restart only the named service."""
+def _deploy(service: str, compose_file: str, self_deploy: bool = False) -> tuple[bool, str]:
+    """Pull latest image + restart only the named service.
+    
+    For self_deploy=True, the 'up -d' step is fire-and-forget (Popen) to
+    avoid the deadlock where docker compose sends SIGTERM to us while we
+    wait for it to complete.
+    """
     pull = subprocess.run(
         ["docker", "compose", "-f", compose_file, "pull", service],
         capture_output=True, text=True, timeout=120
     )
     if pull.returncode != 0:
         return False, f"pull failed: {pull.stderr[:200]}"
-    up = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
-        capture_output=True, text=True, timeout=120
-    )
-    if up.returncode != 0:
-        return False, f"up failed: {up.stderr[:200]}"
-    return True, up.stdout.strip()[:400]
+
+    if self_deploy:
+        # Fire-and-forget: do NOT wait — that would deadlock when docker
+        # sends SIGTERM to us while we're blocked inside up-d.
+        subprocess.Popen(
+            ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True, "self-deploy: pull done, up-d fire-and-forget"
+    else:
+        up = subprocess.run(
+            ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
+            capture_output=True, text=True, timeout=120
+        )
+        if up.returncode != 0:
+            return False, f"up failed: {up.stderr[:200]}"
+        return True, up.stdout.strip()[:400]
 
 
 @app.get("/health")
@@ -100,16 +120,18 @@ async def hook(
         raise HTTPException(status_code=404, detail=f"service '{service}' not in compose map")
 
     compose_file = COMPOSE_MAP[service]
-    log.info(f"queuing deploy {service} from {compose_file}")
+    self_deploy  = (service == SELF_SERVICE)
+    log.info(f"queuing deploy {service} from {compose_file} (self_deploy={self_deploy})")
 
     def run_deploy():
         log.info(f"deploying {service} from {compose_file}")
-        ok, msg = _deploy(service, compose_file)
+        ok, msg = _deploy(service, compose_file, self_deploy=self_deploy)
         outcome = "success" if ok else "failed"
-        _seal_receipt(service, image, outcome, {
-            "compose_file": compose_file, "deploy_msg": msg, "triggered_by": "webhook"
+        receipt_id = _seal_receipt(service, image, outcome, {
+            "compose_file": compose_file, "deploy_msg": msg,
+            "triggered_by": "webhook", "self_deploy": self_deploy,
         })
-        log.info(f"deploy {service} finished: {outcome}")
+        log.info(f"deploy {service} finished: {outcome} receipt={receipt_id}")
 
     background_tasks.add_task(run_deploy)
     return {
