@@ -6,8 +6,12 @@ Seals a ProofLink receipt (category gitops_deploy) for every deploy.
 
 Flow: git push → GitHub Action → POST /hook → HMAC verify →
       docker compose pull && up -d → append.py receipt seal
+      
+Self-deploy: pull new image, seal receipt, send SIGTERM to self.
+The host systemd gitops-receiver.service restarts and recreates
+the container from the already-pulled image.
 """
-import hashlib, hmac, json, logging, os, subprocess, time
+import hashlib, hmac, json, logging, os, signal, subprocess, time
 from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 from typing import Optional
 
@@ -17,15 +21,8 @@ log = logging.getLogger("gitops.receiver")
 WEBHOOK_SECRET   = os.environ.get("GITOPS_WEBHOOK_SECRET", "")
 APPEND_PY        = os.environ.get("APPEND_PY", "/opt/itechsmart/audit_ledger/append.py")
 COMPOSE_DIR      = os.environ.get("COMPOSE_DIR", "/opt/itechsmart/iTechSmart-Suite")
-
-COMPOSE_MAP: dict[str, str] = json.loads(
-    os.environ.get("GITOPS_COMPOSE_MAP", "{}")
-)
-
-# If our own service name is in the map, detect self-deploy to break the
-# SIGTERM-deadlock: docker compose up -d sends SIGTERM to us while we wait
-# for it → SIGKILL → new container stuck in Created state.
-SELF_SERVICE = os.environ.get("GITOPS_SELF_SERVICE", "gitops_receiver")
+COMPOSE_MAP: dict[str, str] = json.loads(os.environ.get("GITOPS_COMPOSE_MAP", "{}"))
+SELF_SERVICE     = os.environ.get("GITOPS_SELF_SERVICE", "gitops_receiver")
 
 app = FastAPI(title="iTechSmart GitOps Receiver", docs_url=None, redoc_url=None)
 
@@ -60,37 +57,21 @@ def _seal_receipt(service: str, image: str, outcome: str, details: dict) -> Opti
     return None
 
 
-def _deploy(service: str, compose_file: str, self_deploy: bool = False) -> tuple[bool, str]:
-    """Pull latest image + restart only the named service.
-    
-    For self_deploy=True, the 'up -d' step is fire-and-forget (Popen) to
-    avoid the deadlock where docker compose sends SIGTERM to us while we
-    wait for it to complete.
-    """
+def _deploy(service: str, compose_file: str) -> tuple[bool, str]:
+    """Pull latest image + restart only the named service."""
     pull = subprocess.run(
         ["docker", "compose", "-f", compose_file, "pull", service],
         capture_output=True, text=True, timeout=120
     )
     if pull.returncode != 0:
         return False, f"pull failed: {pull.stderr[:200]}"
-
-    if self_deploy:
-        # Fire-and-forget: do NOT wait — that would deadlock when docker
-        # sends SIGTERM to us while we're blocked inside up-d.
-        subprocess.Popen(
-            ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        return True, "self-deploy: pull done, up-d fire-and-forget"
-    else:
-        up = subprocess.run(
-            ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
-            capture_output=True, text=True, timeout=120
-        )
-        if up.returncode != 0:
-            return False, f"up failed: {up.stderr[:200]}"
-        return True, up.stdout.strip()[:400]
+    up = subprocess.run(
+        ["docker", "compose", "-f", compose_file, "up", "-d", "--no-deps", service],
+        capture_output=True, text=True, timeout=120
+    )
+    if up.returncode != 0:
+        return False, f"up failed: {up.stderr[:200]}"
+    return True, up.stdout.strip()[:400]
 
 
 @app.get("/health")
@@ -121,17 +102,36 @@ async def hook(
 
     compose_file = COMPOSE_MAP[service]
     self_deploy  = (service == SELF_SERVICE)
-    log.info(f"queuing deploy {service} from {compose_file} (self_deploy={self_deploy})")
+    log.info(f"queuing deploy {service} (self_deploy={self_deploy})")
 
     def run_deploy():
-        log.info(f"deploying {service} from {compose_file}")
-        ok, msg = _deploy(service, compose_file, self_deploy=self_deploy)
-        outcome = "success" if ok else "failed"
-        receipt_id = _seal_receipt(service, image, outcome, {
-            "compose_file": compose_file, "deploy_msg": msg,
-            "triggered_by": "webhook", "self_deploy": self_deploy,
-        })
-        log.info(f"deploy {service} finished: {outcome} receipt={receipt_id}")
+        if self_deploy:
+            # Pull the new image so systemd restart picks it up, then exit.
+            # Host systemd gitops-receiver.service will recreate container.
+            log.info(f"self-deploy: pulling {service} image")
+            pull = subprocess.run(
+                ["docker", "compose", "-f", compose_file, "pull", service],
+                capture_output=True, text=True, timeout=120
+            )
+            ok = pull.returncode == 0
+            msg = "pulled" if ok else f"pull failed: {pull.stderr[:200]}"
+            receipt_id = _seal_receipt(service, image, "success" if ok else "failed", {
+                "compose_file": compose_file, "deploy_msg": msg,
+                "triggered_by": "webhook", "self_deploy": True,
+                "restart_by": "systemd gitops-receiver.service",
+            })
+            log.info(f"self-deploy {service}: {msg} receipt={receipt_id}")
+            if ok:
+                log.info("self-deploy: sending SIGTERM to self — systemd will restart")
+                os.kill(1, signal.SIGTERM)
+        else:
+            log.info(f"deploying {service} from {compose_file}")
+            ok, msg = _deploy(service, compose_file)
+            outcome = "success" if ok else "failed"
+            receipt_id = _seal_receipt(service, image, outcome, {
+                "compose_file": compose_file, "deploy_msg": msg, "triggered_by": "webhook"
+            })
+            log.info(f"deploy {service} finished: {outcome} receipt={receipt_id}")
 
     background_tasks.add_task(run_deploy)
     return {
