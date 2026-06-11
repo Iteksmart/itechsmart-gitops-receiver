@@ -121,7 +121,7 @@ async def hook(
                 "restart_by": "systemd gitops-receiver.service",
             })
             log.info(f"self-deploy {service}: {msg} receipt={receipt_id}")
-            if ok:
+            if False:  # systemd/Watchtower handles restart; never self-SIGTERM
                 log.info("self-deploy: sending SIGTERM to self — systemd will restart")
                 os.kill(1, signal.SIGTERM)
         else:
