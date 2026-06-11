@@ -8,7 +8,7 @@ Flow: git push → GitHub Action → POST /hook → HMAC verify →
       docker compose pull && up -d → append.py receipt seal
 """
 import hashlib, hmac, json, logging, os, subprocess, time
-from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +81,7 @@ def health():
 @app.post("/hook")
 async def hook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_hub_signature_256: str = Header(default=""),
 ):
     body = await request.body()
@@ -99,13 +100,19 @@ async def hook(
         raise HTTPException(status_code=404, detail=f"service '{service}' not in compose map")
 
     compose_file = COMPOSE_MAP[service]
-    log.info(f"deploying {service} from {compose_file}")
-    ok, msg = _deploy(service, compose_file)
-    outcome = "success" if ok else "failed"
-    receipt_id = _seal_receipt(service, image, outcome, {
-        "compose_file": compose_file, "deploy_msg": msg, "triggered_by": "webhook"
-    })
+    log.info(f"queuing deploy {service} from {compose_file}")
+
+    def run_deploy():
+        log.info(f"deploying {service} from {compose_file}")
+        ok, msg = _deploy(service, compose_file)
+        outcome = "success" if ok else "failed"
+        _seal_receipt(service, image, outcome, {
+            "compose_file": compose_file, "deploy_msg": msg, "triggered_by": "webhook"
+        })
+        log.info(f"deploy {service} finished: {outcome}")
+
+    background_tasks.add_task(run_deploy)
     return {
-        "ok": ok, "service": service, "outcome": outcome,
-        "receipt_id": receipt_id, "msg": msg[:200]
+        "ok": True, "service": service, "outcome": "queued",
+        "receipt_id": None, "msg": "deploy queued"
     }
